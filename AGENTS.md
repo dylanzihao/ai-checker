@@ -10,7 +10,7 @@
 |------|----------|------|
 | 数据处理 | 本地 | 清洗、划分、增强 |
 | 训练 | Kaggle | 通过 run.ipynb 从 GitHub 克隆代码并执行 |
-| 推理 | 本地 | INT8 量化 + 推理，针对 Intel GPU/NPU 优化 |
+| 推理 | 本地 | OpenVINO IR 转换（FP32/INT8）+ 推理，针对 Intel GPU/NPU 优化 |
 
 ## 目录结构规范
 
@@ -35,11 +35,13 @@ ai-checker/
 │   │   ├── trainer.py           # 训练主逻辑（HuggingFace Trainer API）
 │   │   └── visualize.py         # matplotlib 训练成果可视化
 │   ├── inference/               # 推理相关代码
-│   │   ├── quantize.py          # INT8 量化脚本
-│   │   └── predict.py           # 推理脚本
+│   │   ├── convert.py           # 模型转换：FP32 OpenVINO IR（可选 INT8 量化）
+│   │   ├── predict.py           # 推理脚本
+│   │   └── compare.py           # FP32 IR vs INT8 IR 性能对比
 │   └── run.ipynb                # Kaggle 训练入口 Notebook
 ├── models/                      # 模型保存（gitignored）
 │   ├── base/                    # 微调后的 FP32 模型
+│   ├── ir/                      # FP32 OpenVINO IR 模型
 │   ├── quantized/               # INT8 量化模型
 │   └── cache/                   # OpenVINO 编译缓存（自动生成）
 ├── requirements/                # 依赖文件
@@ -148,27 +150,40 @@ fp16: true                        # T4 支持混合精度加速
 
 ## 推理规范
 
-### 量化
+### 模型转换与量化
 
-- 使用 `optimum-intel` + `openvino` + `nncf` 实现 INT8 量化
-- 目标硬件：Intel GPU / NPU
-- 量化策略：
-  - 使用 NNCF 进行 INT8 PTQ（Post-Training Quantization）
+`convert.py` 统一负责模型转换，默认将 PyTorch FP32 模型直接转换为 OpenVINO IR（不量化），也可选做 INT8 量化。
+
+- **FP32 OpenVINO IR 转换（默认，不量化）**
+  - 使用 `optimum-intel` 将 PyTorch 模型导出为 OpenVINO IR（FP32 权重）
+  - 无需校准数据集，直接转换
+  - 输出：FP32 OpenVINO IR 模型（`.xml` + `.bin`）+ tokenizer
+- **INT8 量化（可选 `--quantize`）**
+  - 使用 `optimum-intel` + `openvino` + `nncf` 实现 INT8 PTQ（Post-Training Quantization）
   - 需要校准数据集：从验证集中抽取 200-500 条，覆盖各类别和 Human/AI 两种标签，不重复使用训练集
-  - 导出为 OpenVINO IR 格式
   - 针对 Intel GPU (OpenCL) 和 NPU 进行推理优化
-- 输出：量化后的 OpenVINO IR 模型（`.xml` + `.bin`），以及校准后的精度对比报告
+  - 输出：量化后的 OpenVINO IR 模型（`.xml` + `.bin`），以及校准后的精度对比报告
+- 目标硬件：Intel GPU / NPU
 
 ### 推理
 
-- 支持 FP32（原始模型）和 INT8（量化模型）两种模式
+- 支持三种模式：FP32（PyTorch）、FP32 OpenVINO IR、INT8 OpenVINO IR
 - 输入：单条文本 或 jsonl 批量文件
 - 输出：label（0/1）和置信度概率
 - 支持 Intel GPU / NPU 设备选择
-- 性能对比：输出 FP32 vs INT8 的推理速度和精度对比
 - 长文本处理：超过 max_length（512 tokens）时自动使用滑动窗口（50% 重叠 token 级切分，log-softmax 平均聚合）
 
-### 编译缓存（仅 INT8 / OpenVINO 模式有效）
+### 性能对比（compare.py）
+
+`compare.py` 独立负责 FP32 IR vs INT8 IR 的性能对比，`predict.py` 不再包含对比功能。
+
+- 加载 FP32 OpenVINO IR 模型（`--fp32-ir-model-path`，默认 `models/ir`）与 INT8 OpenVINO IR 模型（`--int8-model-path`，默认 `models/quantized`）
+- 输入：单条文本 或 jsonl 批量文件
+- 输出：两个模型的推理耗时、吞吐量（texts/s）、加速比（speedup），以及标签一致性
+- 支持 `--device`（CPU/GPU/NPU）和 `--cache-dir`（编译缓存）
+- 两模型使用相同设备、batch size 和 max_length，保证对比公平
+
+### 编译缓存（仅 OpenVINO 模式有效）
 
 - 首次推理时 OpenVINO 会对模型进行设备编译（NPU/GPU 耗时较长，CPU 数秒）
 - 指定 `--cache-dir` 后，编译结果缓存到磁盘，后续推理直接加载，秒级启动
@@ -238,23 +253,36 @@ python src/train/trainer.py
 ### 推理
 
 ```bash
-# 1. INT8 量化：加载微调后的 FP32 模型，用 NNCF 量化并导出 OpenVINO IR
-#    需要校准文件（从验证集抽取的 200-500 条 JSONL）
-#    输出 models/quantized/ 下的 .xml + .bin
-python src/inference/quantize.py \
+# 1. FP32 OpenVINO IR 转换（不量化）：加载微调后的 FP32 模型，直接导出 OpenVINO IR
+#    无需校准文件
+#    输出 --output-dir 下的 .xml + .bin（示例为 models/ir）
+python src/inference/convert.py \
     --model-path models/base \
-    --calibration-file data/processed/val.jsonl \
-    --calibration-samples 300 \
-    --output-dir models/quantized
+    --output-dir models/ir
 
-# 2. 单条文本预测
+# 2. INT8 量化（可选）：加 --quantize，用 NNCF 量化并导出 OpenVINO IR
+#    需要校准文件（从验证集抽取的 200-500 条 JSONL）
+#    输出 --output-dir 下的 .xml + .bin（示例为 models/quantized）
+python src/inference/convert.py \
+    --model-path models/base \
+    --output-dir models/quantized \
+    --quantize \
+    --calibration-file data/processed/val.jsonl \
+    --calibration-samples 300
+
+# 3. 单条文本预测（FP32 PyTorch / FP32 IR / INT8 IR）
+python src/inference/predict.py --model-path models/base --text "待检测文本"
+python src/inference/predict.py --model-path models/ir --text "待检测文本"
 python src/inference/predict.py --model-path models/quantized --text "待检测文本"
 
-# 3. 批量文件预测（JSONL 格式，带编译缓存加速首次启动）
-python src/inference/predict.py --model-path models/quantized --input-file data/test.jsonl \
+# 4. 批量文件预测（JSONL 格式，带编译缓存加速首次启动）
+python src/inference/predict.py --model-path models/ir --input-file data/test.jsonl \
     --cache-dir models/cache --output-file results.jsonl
 
-# 4. 对比 FP32 与 INT8 性能
-python src/inference/predict.py --model-path models/base --text "待检测文本"
-python src/inference/predict.py --model-path models/quantized --text "待检测文本"
+# 5. 性能对比：FP32 IR vs INT8 IR（独立程序 compare.py）
+python src/inference/compare.py \
+    --fp32-ir-model-path models/ir \
+    --int8-model-path models/quantized \
+    --input-file data/test.jsonl \
+    --cache-dir models/cache
 ```

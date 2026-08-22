@@ -14,8 +14,8 @@
     # 批量文件推理
     python src/inference/predict.py --model-path models/quantized --input-file data/test.jsonl --output-file results.jsonl
 
-    # 性能对比（同时指定两个模型路径）
-    python src/inference/predict.py --model-path models/quantized --fp32-model-path models/base --text "待检测文本"
+    # 性能对比（FP32 IR vs INT8 IR）
+    python src/inference/predict.py --model-path models/quantized --fp32-ir-model-path models/ir --text "待检测文本"
 
 标签: 0 = AI-Generated, 1 = Human
 """
@@ -481,8 +481,8 @@ def main():
 
     parser.add_argument("--model-path", type=str, default="models/base",
                         help="模型路径: FP32 目录 或 INT8 目录（默认: models/base）")
-    parser.add_argument("--fp32-model-path", type=str, default=None,
-                        help="FP32 模型路径（用于与 INT8 对比，此时 --model-path 应为 INT8 路径）")
+    parser.add_argument("--fp32-ir-model-path", type=str, default=None,
+                        help="FP32 OpenVINO IR 模型路径（用于与 INT8 IR 对比，此时 --model-path 应为 INT8 IR 路径）")
     parser.add_argument("--device", type=str, default="CPU",
                         choices=["CPU", "GPU", "NPU"],
                         help="OpenVINO 推理设备（默认: CPU，仅 INT8 模式有效）")
@@ -555,7 +555,7 @@ def main():
         run_interactive(classifier)
         return
 
-    is_comparison = args.fp32_model_path and is_ov
+    is_comparison = args.fp32_ir_model_path and is_ov
 
     if args.input_file:
         texts = read_input_file(args.input_file)
@@ -582,15 +582,23 @@ def main():
             output_results(results, args.output_file)
 
     # =====================================================================
-    # FP32 vs INT8 对比（如果指定了 --fp32-model-path）
+    # FP32 IR vs INT8 IR 对比（如果指定了 --fp32-ir-model-path）
     # =====================================================================
 
-    if args.fp32_model_path and is_ov and (args.text or args.input_file):
-        logger.info("--- FP32 vs INT8 Comparison ---")
-        fp32 = FP32Classifier(
-            args.fp32_model_path,
+    if args.fp32_ir_model_path and is_ov and (args.text or args.input_file):
+        logger.info("--- FP32 IR vs INT8 IR Comparison ---")
+        fp32_ir_model, fp32_ir_tokenizer = load_ov_model(
+            args.fp32_ir_model_path,
+            device=args.device,
             max_length=args.max_length,
-            batch_size=args.batch_size,
+            batch_size=ov_batch_size,
+            cache_dir=args.cache_dir,
+        )
+        fp32_ir = OVClassifier(
+            fp32_ir_model, fp32_ir_tokenizer,
+            max_length=args.max_length,
+            batch_size=ov_batch_size,
+            static_shape=(args.device in ("NPU", "GPU")),
         )
 
         if args.text:
@@ -599,27 +607,27 @@ def main():
             texts = read_input_file(args.input_file)
 
         t0 = time.perf_counter()
-        fp32_results = fp32.predict(texts)
-        fp32_time = time.perf_counter() - t0
+        fp32_ir_results = fp32_ir.predict(texts)
+        fp32_ir_time = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         int8_results = classifier.predict(texts)
         int8_time = time.perf_counter() - t0
 
-        logger.info("FP32: %.3fs (%.1f texts/s)", fp32_time, len(texts) / fp32_time if fp32_time > 0 else 0)
-        logger.info("INT8: %.3fs (%.1f texts/s)", int8_time, len(texts) / int8_time if int8_time > 0 else 0)
-        logger.info("Speedup: %.2fx", fp32_time / int8_time if int8_time > 0 else 0)
+        logger.info("FP32 IR: %.3fs (%.1f texts/s)", fp32_ir_time, len(texts) / fp32_ir_time if fp32_ir_time > 0 else 0)
+        logger.info("INT8 IR: %.3fs (%.1f texts/s)", int8_time, len(texts) / int8_time if int8_time > 0 else 0)
+        logger.info("Speedup: %.2fx", fp32_ir_time / int8_time if int8_time > 0 else 0)
 
-        fp32_labels = [r["label_id"] for r in (fp32_results if isinstance(fp32_results, list) else [fp32_results])]
+        fp32_ir_labels = [r["label_id"] for r in (fp32_ir_results if isinstance(fp32_ir_results, list) else [fp32_ir_results])]
         int8_labels = [r["label_id"] for r in (int8_results if isinstance(int8_results, list) else [int8_results])]
-        match_count = sum(1 for a, b in zip(fp32_labels, int8_labels) if a == b)
-        logger.info("Label match: %d/%d (%.1f%%)", match_count, len(fp32_labels),
-                    100.0 * match_count / len(fp32_labels) if fp32_labels else 0)
+        match_count = sum(1 for a, b in zip(fp32_ir_labels, int8_labels) if a == b)
+        logger.info("Label match: %d/%d (%.1f%%)", match_count, len(fp32_ir_labels),
+                    100.0 * match_count / len(fp32_ir_labels) if fp32_ir_labels else 0)
 
         if not args.output_file:
-            print(f"\n--- FP32 ---")
-            output_results(fp32_results)
-            print(f"\n--- INT8 ---")
+            print(f"\n--- FP32 IR ---")
+            output_results(fp32_ir_results)
+            print(f"\n--- INT8 IR ---")
             output_results(int8_results)
 
     del classifier
