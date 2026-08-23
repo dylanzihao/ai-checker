@@ -8,7 +8,7 @@
 |------|------|------|
 | 数据处理 | 本地 | 清洗、划分、增强 C-ReD 数据集 |
 | 训练 | Kaggle (2×T4) | HuggingFace Trainer + DDP 分布式训练 |
-| 推理 | 本地 | INT8 量化 (OpenVINO/NNCF) + 推理，支持 Intel GPU/NPU |
+| 推理 | 本地 | OpenVINO IR 转换 (FP32/INT8) + 推理，支持 Intel GPU/NPU |
 
 ## 目录结构
 
@@ -28,11 +28,13 @@ ai-checker/
 │   │   ├── trainer.py          # 训练主逻辑
 │   │   └── visualize.py        # 训练可视化
 │   ├── inference/
-│   │   ├── quantize.py         # INT8 量化
-│   │   └── predict.py          # 推理脚本
+│   │   ├── convert.py          # 模型转换：FP32 OpenVINO IR（可选 INT8 量化）
+│   │   ├── predict.py          # 推理脚本
+│   │   └── compare.py          # FP32 IR vs INT8 IR 性能对比
 │   └── run.ipynb               # Kaggle 训练入口
 ├── models/
 │   ├── base/                   # 微调后的 FP32 模型
+│   ├── ir/                     # FP32 OpenVINO IR 模型
 │   ├── quantized/              # INT8 量化模型 (OpenVINO IR)
 │   └── cache/                  # OpenVINO 编译缓存
 ├── requirements/
@@ -44,7 +46,7 @@ ai-checker/
 ## 快速开始
 
 ```bash
-git clone https://github.com/your-username/ai-checker.git
+git clone https://github.com/dylanzihao/ai-checker.git
 cd ai-checker
 
 pip install -r requirements/requirements-local.txt
@@ -57,9 +59,9 @@ python src/data/augment.py
 # 2. 训练（本地单机调试）
 python src/train/trainer.py
 
-# 3. 量化 + 推理
-python src/inference/quantize.py --model-path models/base --calibration-file data/processed/val.jsonl --calibration-samples 300 --output-dir models/quantized
-python src/inference/predict.py --model-path models/quantized --text "待检测文本"
+# 3. 转换 OpenVINO IR + 推理
+python src/inference/convert.py --model-path models/base --output-dir models/ir
+python src/inference/predict.py --model-path models/ir --text "待检测文本"
 ```
 
 ## 详细用法
@@ -111,23 +113,35 @@ python src/train/trainer.py
 
 ### 推理
 
-**INT8 量化：** 将 FP32 模型转换为 OpenVINO IR 格式，使用 NNCF 进行 INT8 PTQ。
+**FP32 OpenVINO IR 转换（不量化）：** 将 FP32 模型直接转换为 OpenVINO IR 格式，无需校准数据。
 
 ```bash
-python src/inference/quantize.py \
+python src/inference/convert.py \
     --model-path models/base \
+    --output-dir models/ir
+```
+
+**INT8 量化（可选）：** 加上 `--quantize`，使用 NNCF 进行 INT8 PTQ。
+
+```bash
+python src/inference/convert.py \
+    --model-path models/base \
+    --output-dir models/quantized \
+    --quantize \
     --calibration-file data/processed/val.jsonl \
-    --calibration-samples 300 \
-    --output-dir models/quantized
+    --calibration-samples 300
 ```
 
 **单条文本预测：**
 
 ```bash
-# FP32 模式
+# FP32 模式（PyTorch）
 python src/inference/predict.py --model-path models/base --text "待检测文本"
 
-# INT8 模式（需先完成量化）
+# FP32 OpenVINO IR 模式
+python src/inference/predict.py --model-path models/ir --text "待检测文本"
+
+# INT8 OpenVINO IR 模式（需先完成量化）
 python src/inference/predict.py --model-path models/quantized --text "待检测文本"
 ```
 
@@ -135,34 +149,45 @@ python src/inference/predict.py --model-path models/quantized --text "待检测�
 
 ```bash
 python src/inference/predict.py \
-    --model-path models/quantized \
+    --model-path models/ir \
     --input-file data/test.jsonl \
     --cache-dir models/cache \
     --output-file results.jsonl
 ```
 
-**FP32 vs INT8 性能对比：**
+**FP32 IR vs INT8 IR 性能对比：**
 
 ```bash
-python src/inference/predict.py \
-    --model-path models/base \
-    --compare-with models/quantized \
-    --input-file data/test.jsonl
+python src/inference/compare.py \
+    --fp32-ir-model-path models/ir \
+    --int8-model-path models/quantized \
+    --input-file data/test.jsonl \
+    --cache-dir models/cache
 ```
 
 推理参数：
 
 | 参数 | 说明 |
 |------|------|
-| `--model-path` | 模型路径（FP32 目录或 INT8 IR 目录） |
+| `--model-path` | 模型路径（FP32 PyTorch 目录或 OpenVINO IR 目录） |
 | `--text` | 单条待检测文本 |
 | `--input-file` | 批量输入 JSONL 文件 |
+| `--interactive` | 交互式推理模式 |
 | `--output-file` | 预测结果输出路径 |
-| `--device` | 推理设备：cpu / gpu / npu（仅 INT8 模式） |
+| `--device` | 推理设备：CPU / GPU / NPU（仅 OpenVINO 模式） |
 | `--cache-dir` | OpenVINO 编译缓存目录 |
+| `--batch-size` | 批量推理大小 |
 | `--max-length` | 最大 token 长度（默认 512，超长文本自动滑动窗口） |
-| `--eval-labels` | 提供标签列名以计算准确率 |
-| `--compare-with` | 对比模型路径，输出速度和标签一致性 |
+| `--eval-labels` | 标注文件路径（与 --input-file 同源，用于计算准确率） |
+
+性能对比参数（`compare.py`）：
+
+| 参数 | 说明 |
+|------|------|
+| `--fp32-ir-model-path` | FP32 OpenVINO IR 模型路径（默认 models/ir） |
+| `--int8-model-path` | INT8 OpenVINO IR 模型路径（默认 models/quantized） |
+| `--device` | 推理设备：CPU / GPU / NPU |
+| `--eval-labels` | 标注文件路径（默认使用 --input-file 的 label 字段） |
 
 ## 依赖
 
