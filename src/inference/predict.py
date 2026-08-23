@@ -1,21 +1,23 @@
 """
-推理脚本 —— 支持 FP32（HuggingFace）和 INT8（OpenVINO）两种模式。
+推理脚本 —— 支持三种模式：FP32（PyTorch）、FP32 OpenVINO IR、INT8 OpenVINO IR。
 
 - FP32 模式：加载 PyTorch 模型（models/base/），使用 HuggingFace pipeline 推理
-- INT8 模式：加载 OpenVINO IR 模型（models/quantized/），支持 CPU / GPU / NPU 加速
+- OpenVINO 模式：加载 OpenVINO IR 模型（models/ir 或 models/quantized/），支持 CPU / GPU / NPU 加速
 
 用法:
-    # FP32 单条文本推理
+    # FP32 单条文本推理（PyTorch）
     python src/inference/predict.py --model-path models/base --text "待检测文本"
 
-    # INT8 推理（CPU）
+    # FP32 OpenVINO IR 推理
+    python src/inference/predict.py --model-path models/ir --text "待检测文本"
+
+    # INT8 OpenVINO IR 推理（CPU）
     python src/inference/predict.py --model-path models/quantized --device CPU --text "待检测文本"
 
     # 批量文件推理
-    python src/inference/predict.py --model-path models/quantized --input-file data/test.jsonl --output-file results.jsonl
+    python src/inference/predict.py --model-path models/ir --input-file data/test.jsonl --output-file results.jsonl
 
-    # 性能对比（FP32 IR vs INT8 IR）
-    python src/inference/predict.py --model-path models/quantized --fp32-ir-model-path models/ir --text "待检测文本"
+性能对比请使用独立程序 compare.py（FP32 IR vs INT8 IR）。
 
 标签: 0 = AI-Generated, 1 = Human
 """
@@ -234,7 +236,7 @@ class FP32Classifier:
 
 
 # ==============================================================================
-# INT8 推理（OpenVINO）
+# OpenVINO 推理（FP32 IR / INT8 IR）
 # ==============================================================================
 
 
@@ -440,7 +442,7 @@ def compute_accuracy(results: List[Dict], labels_file: str = None) -> Dict:
 def run_interactive(classifier):
     """交互模式。"""
     is_ov = isinstance(classifier, OVClassifier)
-    mode_str = "INT8(OpenVINO)" if is_ov else "FP32(PyTorch)"
+    mode_str = "OpenVINO" if is_ov else "FP32(PyTorch)"
     print(f"\n{'=' * 60}")
     print(f"  ai-checker 交互式推理模式 [{mode_str}]")
     print(f"  输入文本后按回车检测，输入 :q 或 :quit 退出")
@@ -475,17 +477,15 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(
-        description="ai-checker 推理脚本 —— 支持 FP32(PyTorch) 和 INT8(OpenVINO)",
+        description="ai-checker 推理脚本 —— 支持 FP32(PyTorch) 和 OpenVINO(FP32 IR / INT8 IR)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument("--model-path", type=str, default="models/base",
-                        help="模型路径: FP32 目录 或 INT8 目录（默认: models/base）")
-    parser.add_argument("--fp32-ir-model-path", type=str, default=None,
-                        help="FP32 OpenVINO IR 模型路径（用于与 INT8 IR 对比，此时 --model-path 应为 INT8 IR 路径）")
+                        help="模型路径: FP32 PyTorch 目录 或 OpenVINO IR 目录（默认: models/base）")
     parser.add_argument("--device", type=str, default="CPU",
                         choices=["CPU", "GPU", "NPU"],
-                        help="OpenVINO 推理设备（默认: CPU，仅 INT8 模式有效）")
+                        help="OpenVINO 推理设备（默认: CPU，仅 OpenVINO 模式有效）")
 
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--text", type=str, default=None,
@@ -498,7 +498,7 @@ def main():
     parser.add_argument("--max-length", type=int, default=512,
                         help="最大序列长度（默认: 512）")
     parser.add_argument("--batch-size", type=int, default=8,
-                        help="批量推理大小（默认: 8，INT8 模式 CPU 默认: 32）")
+                        help="批量推理大小（默认: 8，OpenVINO 模式 CPU 默认: 32）")
     parser.add_argument("--output-file", type=str, default=None,
                         help="结果输出 JSONL 文件路径")
     parser.add_argument("--cache-dir", type=str, default=None,
@@ -535,7 +535,7 @@ def main():
             batch_size=ov_batch_size,
             static_shape=(args.device in ("NPU", "GPU")),
         )
-        logger.info("Using INT8(OpenVINO) mode")
+        logger.info("Using OpenVINO mode")
     else:
         fp32_batch_size = args.batch_size
         classifier = FP32Classifier(
@@ -555,8 +555,6 @@ def main():
         run_interactive(classifier)
         return
 
-    is_comparison = args.fp32_ir_model_path and is_ov
-
     if args.input_file:
         texts = read_input_file(args.input_file)
         logger.info("Loaded %d texts from %s", len(texts), args.input_file)
@@ -565,8 +563,7 @@ def main():
         elapsed = time.perf_counter() - t0
         logger.info("Inference done in %.2fs (%.1f texts/s)",
                     elapsed, len(texts) / elapsed if elapsed > 0 else 0)
-        if not is_comparison:
-            output_results(results, args.output_file)
+        output_results(results, args.output_file)
 
         if args.eval_labels:
             metrics = compute_accuracy(results, args.eval_labels)
@@ -578,57 +575,7 @@ def main():
         results = classifier.predict(args.text)
         elapsed = time.perf_counter() - t0
         logger.info("Inference done in %.3fs", elapsed)
-        if not is_comparison:
-            output_results(results, args.output_file)
-
-    # =====================================================================
-    # FP32 IR vs INT8 IR 对比（如果指定了 --fp32-ir-model-path）
-    # =====================================================================
-
-    if args.fp32_ir_model_path and is_ov and (args.text or args.input_file):
-        logger.info("--- FP32 IR vs INT8 IR Comparison ---")
-        fp32_ir_model, fp32_ir_tokenizer = load_ov_model(
-            args.fp32_ir_model_path,
-            device=args.device,
-            max_length=args.max_length,
-            batch_size=ov_batch_size,
-            cache_dir=args.cache_dir,
-        )
-        fp32_ir = OVClassifier(
-            fp32_ir_model, fp32_ir_tokenizer,
-            max_length=args.max_length,
-            batch_size=ov_batch_size,
-            static_shape=(args.device in ("NPU", "GPU")),
-        )
-
-        if args.text:
-            texts = [args.text]
-        else:
-            texts = read_input_file(args.input_file)
-
-        t0 = time.perf_counter()
-        fp32_ir_results = fp32_ir.predict(texts)
-        fp32_ir_time = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        int8_results = classifier.predict(texts)
-        int8_time = time.perf_counter() - t0
-
-        logger.info("FP32 IR: %.3fs (%.1f texts/s)", fp32_ir_time, len(texts) / fp32_ir_time if fp32_ir_time > 0 else 0)
-        logger.info("INT8 IR: %.3fs (%.1f texts/s)", int8_time, len(texts) / int8_time if int8_time > 0 else 0)
-        logger.info("Speedup: %.2fx", fp32_ir_time / int8_time if int8_time > 0 else 0)
-
-        fp32_ir_labels = [r["label_id"] for r in (fp32_ir_results if isinstance(fp32_ir_results, list) else [fp32_ir_results])]
-        int8_labels = [r["label_id"] for r in (int8_results if isinstance(int8_results, list) else [int8_results])]
-        match_count = sum(1 for a, b in zip(fp32_ir_labels, int8_labels) if a == b)
-        logger.info("Label match: %d/%d (%.1f%%)", match_count, len(fp32_ir_labels),
-                    100.0 * match_count / len(fp32_ir_labels) if fp32_ir_labels else 0)
-
-        if not args.output_file:
-            print(f"\n--- FP32 IR ---")
-            output_results(fp32_ir_results)
-            print(f"\n--- INT8 IR ---")
-            output_results(int8_results)
+        output_results(results, args.output_file)
 
     del classifier
 
