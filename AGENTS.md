@@ -8,7 +8,7 @@
 
 | 阶段 | 执行环境 | 说明 |
 |------|----------|------|
-| 数据处理 | 本地 | 清洗、划分、增强 |
+| 数据处理 | 本地 | 提取、清洗、划分 |
 | 训练 | Kaggle | 通过 run.ipynb 从 GitHub 克隆代码并执行 |
 | 推理 | 本地 | OpenVINO IR 转换（FP32/INT8）+ 推理，针对 Intel GPU/NPU 优化 |
 
@@ -18,18 +18,23 @@
 ai-checker/
 ├── data/
 │   ├── raw/
-│   │   └── C-ReD/               # 原始数据，只读不修改
-│   ├── processed/               # 清洗划分后的数据（JSONL 格式）
-│   │   ├── train.jsonl
-│   │   ├── val.jsonl
-│   │   └── test.jsonl
-│   └── augmented/               # 数据增强后的训练数据（JSONL 格式）
-│       └── train.jsonl
+│   │   ├── C-ReD/               # 原始数据，只读不修改
+│   │   ├── MAGA-cn/             # 原始数据，只读不修改
+│   │   └── unified.jsonl        # extract.py 生成的统一格式数据
+│   ├── cleaned/
+│   │   └── cleaned.jsonl        # clean.py 清洗后的数据
+│   └── processed/               # 划分后的数据（JSONL 格式）
+│       ├── train.jsonl
+│       ├── val.jsonl
+│       └── test.jsonl
 ├── src/
 │   ├── data/                    # 数据处理脚本
+│   │   ├── extract.py           # 数据提取（多数据集 loader 汇总）
+│   │   ├── loaders/             # 各数据集读取模块
+│   │   │   ├── cred.py          # C-ReD loader
+│   │   │   └── maga.py          # MAGA-cn loader
 │   │   ├── clean.py             # 数据清洗
-│   │   ├── split.py             # 数据集划分
-│   │   └── augment.py           # nlpcda 数据增强
+│   │   └── split.py             # 数据集划分
 │   ├── train/                   # 训练相关代码
 │   │   ├── config.py            # 训练配置（路径解析 + TrainingArguments）
 │   │   ├── trainer.py           # 训练主逻辑（HuggingFace Trainer API）
@@ -53,46 +58,55 @@ ai-checker/
 
 ## 数据处理规范
 
+数据处理分为三部分：提取 → 清洗 → 划分。
+
 ### 数据源
 
-- **C-Red** (`data/raw/C-ReD/benchmark data/`)
-- 5 个类别：`composition`, `film_review`, `news`, `paper`, `question_answer`
-- 9 种 AI 模型：`claude-3.5-haiku`, `deepseek-r1`, `deepseek-v3`, `doubao-1.5-pro`, `gemini-2.5-flash`, `gpt-3.5-turbo`, `gpt-4o`, `qwen-2.5`, `qwen-3`
-- label: 1 = human, 0 = AI-generated
+- **C-ReD** (`data/raw/C-ReD/benchmark data/`)
+  - 5 个类别：`composition`, `film_review`, `news`, `paper`, `question_answer`
+  - 9 种 AI 模型：`claude-3.5-haiku`, `deepseek-r1`, `deepseek-v3`, `doubao-1.5-pro`, `gemini-2.5-flash`, `gpt-3.5-turbo`, `gpt-4o`, `qwen-2.5`, `qwen-3`
+  - 使用策略：人类文本全取，机器文本按类别裁剪到与人类等量（每类 human:AI = 1:1）
+- **MAGA-cn** (`data/raw/MAGA-cn/train/MAGA-cn_train.jsonl` + `data/raw/MAGA-cn/val/MAGA-cn_val.jsonl`)
+  - 仅使用 `MAGA-cn` 数据文件，**不使用** `MGB`
+  - `model == "human"` 为人类文本，其余为机器文本
+  - 本身已 1:1 平衡，全部保留
+- **label 统一约定**: 1 = human, 0 = AI-generated
 
-### 数据清洗
+### 数据提取（extract.py）
 
-- 去除空文本或极短文本（长度 < 10 字符）
-- 去除重复文本（基于 text 去重）
-- 统一列名和格式，human 数据补齐 `prompt` 列为空
-- 统一 `label` 字段（int 类型）
-- 去除 HTML 标签、多余空白字符
-- 确保所有 CSV 列结构一致
+- 各数据集 loader 位于 `src/data/loaders/`，每个 loader 暴露 `load() -> list[dict]`
+- 统一 schema：`{text, label, category, source}`
+  - `label`: int，1=human, 0=AI
+  - `category`: C-ReD 类别目录名 或 MAGA-cn 的 `domain` 字段（仅中间字段，用于分层划分，不进入最终输出）
+  - `source`: `C-ReD` 或 `MAGA-cn`
+- 输出 `data/raw/unified.jsonl`
+- 新增数据集：在 `loaders/` 新增模块实现 `load()`，并在 `extract.py` 的 `LOADERS` 中注册
+- **并行**：支持 `--workers`（默认 1，手动指定，`multiprocessing`）并行读取 C-ReD CSV 与解析 MAGA-cn JSONL；C-ReD 机器文本裁剪为串行 + 固定 seed
 
-### 数据集划分
+### 数据清洗（clean.py）
+
+- 清洗步骤（按顺序）：
+  1. 去除 HTML 标签（正则 `<[^>]+>`）
+  2. 去除 URL（正则 `https?://\S+|www\.\S+`）
+  3. 去除 emoji（正则 `1F000-1FAFF`、`2600-27BF`、`2B00-2BFF`、`FE0F`）
+  4. 去除控制字符（正则 `[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]`，保留 `\n\t\r` 交给空白归一）
+  5. 去除乱码 `�`（`U+FFFD`）
+  6. 繁→简转换（`opencc-python-reimplemented` 的 `OpenCC('t2s')`）
+  7. 空白归一（`\s+`→空格）+ 去首尾空格
+  8. 去包裹引号（循环剥离首尾成对引号：`"` `"` `"` `'` `'` `` ` ``）
+  9. 去除空文本或极短文本（长度 < 100 字符）
+- 去除重复文本（基于 text 去重，串行执行）
+- 输出 `data/cleaned/cleaned.jsonl`
+- **并行**：支持 `--workers`（默认 1，手动指定，`multiprocessing`）并行清洗；opencc 用 `Pool(initializer=...)` 每 worker 初始化一个实例；text 去重串行
+
+### 数据集划分（split.py）
 
 - **比例**: 8:1:1（训练:验证:测试）
-- **训练集目标**: ~30K 条
-- **采样策略**: 按类别均匀采样
-  - 5 个类别各采 1/5，约 6000 条/类
-  - 每类内 human:AI = 1:1（约 3000 human + 3000 AI）
-- **分层划分**: 按类别逐层划分，保证各 split 中类别分布和 human/AI 比例一致
-
-### 数据增强（nlpcda）
-
-- 仅对**训练集**进行增强
-- 增强方法：全部使用
-  - **同/近义词替换** (Similarword): 替换为同/近义词
-  - **随机词替换** (Randomword): 随机替换词语
-  - **随机删除字符** (RandomDeleteChar): 随机删除部分字符
-  - **字符位置交换** (CharPositionExchange): 交换句子中字符位置
-  - **等价字替换** (EquivalentChar): 替换为等价字
-  - **同音字替换** (Homophone): 替换为同音字
-- 增强倍率：每个原始样本生成 2-3 个增强样本
-- 注意事项：
-  - 增强后的训练集需保持 1:1 平衡
-  - 增强样本的 label 与原始样本一致
-  - 验证集和测试集不做增强
+- **1:1 下采样**: 划分前按 label 分组，多数类随机下采样到少数类数量（固定 seed=42）
+- **分层划分**: 按 `(category, label)` 逐层划分，保证各 split 中类别分布和 human/AI 比例一致
+- **全量保留**: 不做目标大小采样，固定随机种子（42）保证可复现
+- 最终输出仅含 `text` + `label`（`data/processed/train.jsonl / val.jsonl / test.jsonl`）
+- 无 `--workers`（分层划分为 O(n) 单次遍历，无需并行）
 
 ## 训练规范
 
@@ -205,7 +219,7 @@ fp16: true                        # T4 支持混合精度加速
 ### 本地依赖（数据处理 + 推理）
 
 - pandas, numpy
-- nlpcda
+- opencc-python-reimplemented
 - torch
 - transformers
 - optimum-intel, openvino, nncf
@@ -228,16 +242,19 @@ fp16: true                        # T4 支持混合精度加速
 ### 数据处理
 
 ```bash
-# 1. 数据清洗：读取 raw/C-ReD 所有 CSV，清洗后按类别保存为 JSONL
-python src/data/clean.py
+# 1. 数据提取：读取 C-ReD 与 MAGA-cn，统一 schema 后合并
+#    输出 data/raw/unified.jsonl
+python src/data/extract.py
+python src/data/extract.py --workers 8   # 并行提取（手动指定进程数）
 
-# 2. 数据集划分：读取清洗后的数据，分层采样划分 8:1:1
+# 2. 数据清洗：读取 unified.jsonl，清洗后保存
+#    输出 data/cleaned/cleaned.jsonl
+python src/data/clean.py
+python src/data/clean.py --workers 8     # 并行清洗（手动指定进程数）
+
+# 3. 数据集划分：读取清洗后的数据，1:1 下采样后分层划分 8:1:1
 #    输出 data/processed/train.jsonl / val.jsonl / test.jsonl
 python src/data/split.py
-
-# 3. 数据增强：对训练集进行 nlpcda 增强
-#    输出 data/augmented/train.jsonl
-python src/data/augment.py
 ```
 
 ### 训练

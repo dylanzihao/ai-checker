@@ -1,21 +1,39 @@
 """
-数据清洗脚本：读取 raw/C-ReD 所有 CSV，清洗后按类别保存为 JSONL。
+数据清洗：读取 data/raw/unified.jsonl，清洗后保存。
 
-清洗步骤：
-1. 去除空文本或极短文本（长度 < 10 字符）
-2. 去除重复文本（基于 text 去重）
-3. 统一列名和格式，human 数据补齐 prompt 列为空
-4. 统一 label 字段（int 类型）
-5. 去除 HTML 标签、多余空白字符
-6. 确保所有 CSV 列结构一致
+清洗步骤（按顺序）:
+1. 去除 HTML 标签
+2. 去除 URL
+3. 去除 emoji
+4. 去除控制字符
+5. 去除乱码字符（U+FFFD）
+6. 繁→简转换（OpenCC）
+7. 空白归一 + 去首尾空格
+8. 去包裹引号
+9. 去除空文本或极短文本（长度 < 100 字符）
++ 去除重复文本（基于 text 去重，串行）
+
+输出: data/cleaned/cleaned.jsonl
+
+用法:
+    python src/data/clean.py
+    python src/data/clean.py --workers 8   # 并行清洗（手动指定进程数）
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import logging
+import multiprocessing as mp
 import re
+import sys
 from pathlib import Path
 
-import pandas as pd
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,177 +41,154 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+INPUT_FILE = PROJECT_ROOT / "data" / "raw" / "unified.jsonl"
+OUTPUT_FILE = PROJECT_ROOT / "data" / "cleaned" / "cleaned.jsonl"
 
-# 原始数据目录
-RAW_DIR = PROJECT_ROOT / "data" / "raw" / "C-ReD" / "benchmark data"
-
-# 输出目录
-OUTPUT_DIR = PROJECT_ROOT / "data" / "processed"
-
-# 统一输出列
-UNIFIED_COLUMNS = ["id", "text", "label", "category", "type", "length",
-                   "attribution", "title", "prompt"]
-
-# HTML 标签正则
 HTML_TAG_RE = re.compile(r"<[^>]+>")
-# 多余空白字符正则
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 WHITESPACE_RE = re.compile(r"\s+")
 
+MIN_TEXT_LENGTH = 100
+QUOTE_CHARS = frozenset('"\u201c\u201d\u2018\u2019`')
 
-def clean_text(text: str) -> str:
-    """清洗单条文本：去除 HTML 标签、合并多余空白、去除首尾空格。"""
+
+def _build_emoji_re() -> re.Pattern:
+    """构造 emoji 匹配正则（覆盖主符号区 + 杂项符号 + 变体选择符）。"""
+    ranges = [(0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF)]
+    parts = [f"{chr(a)}-{chr(b)}" for a, b in ranges]
+    parts.append(chr(0xFE0F))
+    return re.compile("[" + "".join(parts) + "]")
+
+
+EMOJI_RE = _build_emoji_re()
+
+# 并行 worker 中的 OpenCC 全局实例
+_worker_cc = None
+
+
+def _init_worker() -> None:
+    """Worker 进程初始化：每个进程创建一个 OpenCC 实例。"""
+    global _worker_cc
+    _worker_cc = None
+    try:
+        from opencc import OpenCC
+        _worker_cc = OpenCC("t2s")
+    except Exception:
+        logger.warning("opencc 不可用，跳过繁→简转换")
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    """循环剥离首尾成对的引号（ASCII/中文引号/反引号）。"""
+    while len(text) >= 2 and text[0] in QUOTE_CHARS and text[-1] in QUOTE_CHARS:
+        text = text[1:-1].strip()
+    return text
+
+
+def clean_text(text: str, cc=None) -> str:
+    """清洗单条文本。"""
     if not isinstance(text, str):
         return ""
     text = HTML_TAG_RE.sub("", text)
+    text = URL_RE.sub("", text)
+    text = EMOJI_RE.sub("", text)
+    text = CONTROL_RE.sub("", text)
+    text = text.replace("\ufffd", "")
+    if not text:
+        return ""
+    if cc is not None:
+        text = cc.convert(text)
     text = WHITESPACE_RE.sub(" ", text)
-    return text.strip()
+    text = text.strip()
+    text = _strip_wrapping_quotes(text)
+    return text
 
 
-def load_csv(filepath: Path) -> pd.DataFrame:
-    """加载单个 CSV 文件，返回标准化的 DataFrame。"""
-    df = pd.read_csv(filepath)
-    logger.debug(f"  读取 {filepath.name}: {len(df)} 条记录, 列: {list(df.columns)}")
-    return df
+def load_records(filepath: Path) -> list[dict]:
+    """读取 JSONL 为记录列表。"""
+    records: list[dict] = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
 
 
-def normalize_df(df: pd.DataFrame, category: str) -> pd.DataFrame:
-    """
-    标准化 DataFrame 为统一格式。
-
-    human 数据（有 year 列，无 prompt 列） → 补齐 prompt 为空
-    AI 数据（有 prompt 和 original_id 列）→ 直接映射
-    """
-    # 统一列映射
-    result = pd.DataFrame()
-
-    # id
-    result["id"] = df["id"] if "id" in df.columns else range(len(df))
-
-    # text: 清洗文本
-    result["text"] = df["text"].apply(clean_text) if "text" in df.columns else ""
-
-    # label: 统一为 int 类型 (1 = human, 0 = AI)
-    if "label" in df.columns:
-        result["label"] = df["label"].astype(int)
-    else:
-        result["label"] = -1
-
-    # category: 使用目录名
-    result["category"] = category
-
-    # type
-    result["type"] = df["type"] if "type" in df.columns else None
-
-    # length
-    result["length"] = df["length"] if "length" in df.columns else None
-
-    # attribution
-    result["attribution"] = df["attribution"] if "attribution" in df.columns else None
-
-    # title: 来自 composition_title 列（两种数据都有）
-    if "composition_title" in df.columns:
-        result["title"] = df["composition_title"]
-    else:
-        result["title"] = None
-
-    # prompt: AI 数据有，human 数据没有 → 补齐为空字符串
-    if "prompt" in df.columns:
-        result["prompt"] = df["prompt"].fillna("")
-    else:
-        result["prompt"] = ""
-
-    return result
-
-
-def clean_and_save() -> dict[str, int]:
-    """
-    主清洗流程：遍历所有类别和 CSV，清洗后按类别保存 JSONL。
-
-    Returns:
-        每个类别的最终记录数统计
-    """
-    if not RAW_DIR.exists():
-        logger.error(f"原始数据目录不存在: {RAW_DIR}")
-        return {}
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    stats: dict[str, dict] = {}  # category → stats dict
-
-    for category_dir in sorted(RAW_DIR.iterdir()):
-        if not category_dir.is_dir():
+def _clean_chunk(records: list[dict]) -> list[dict]:
+    """清洗一个分块，返回保留的记录。"""
+    global _worker_cc
+    cc = _worker_cc
+    cleaned: list[dict] = []
+    for record in records:
+        text = clean_text(record.get("text", ""), cc)
+        if len(text) < MIN_TEXT_LENGTH:
             continue
+        record["text"] = text
+        cleaned.append(record)
+    return cleaned
 
-        category = category_dir.name.replace(" ", "_")  # e.g. "film_review", "question_answer"
-        logger.info(f"处理类别: {category} ({category_dir})")
 
-        all_records: list[dict] = []
-        category_stats = {"total_raw": 0, "after_empty_removal": 0, "after_dedup": 0}
+def _chunk_records(records: list[dict], num_chunks: int) -> list[list[dict]]:
+    """将记录拆分为 num_chunks 个大致均匀的块。"""
+    num_chunks = max(1, num_chunks)
+    chunk_size = max(1, len(records) // num_chunks)
+    chunks: list[list[dict]] = []
+    for i in range(0, len(records), chunk_size):
+        chunks.append(records[i:i + chunk_size])
+    return chunks
 
-        csv_files = sorted(category_dir.glob("*.csv"))
-        if not csv_files:
-            logger.warning(f"  类别 {category} 中没有 CSV 文件")
-            continue
 
-        for csv_file in csv_files:
-            df_raw = load_csv(csv_file)
-            category_stats["total_raw"] += len(df_raw)
-            df_norm = normalize_df(df_raw, category)
-            all_records.extend(df_norm.to_dict(orient="records"))
+def clean(workers: int = 1) -> list[dict]:
+    """主清洗流程：并行清洗 + 串行去重。"""
+    records = load_records(INPUT_FILE)
+    logger.info("读取 %d 条", len(records))
 
-        logger.info(f"  原始记录数: {category_stats['total_raw']}")
+    if workers <= 1:
+        _init_worker()
+        cleaned = _clean_chunk(records)
+    else:
+        chunks = _chunk_records(records, workers * 4)
+        cleaned = []
+        with mp.Pool(processes=workers, initializer=_init_worker) as pool:
+            for chunk in pool.imap(_clean_chunk, chunks):
+                cleaned.extend(chunk)
 
-        # 1. 去除空文本或极短文本（长度 < 10 字符）
-        before = len(all_records)
-        all_records = [r for r in all_records
-                       if isinstance(r["text"], str) and len(r["text"]) >= 10]
-        category_stats["after_empty_removal"] = len(all_records)
-        logger.info(f"  去除空/短文本: {before} → {len(all_records)} "
-                     f"(移除 {before - len(all_records)} 条)")
+    logger.info("清洗后（去重前）: %d 条", len(cleaned))
 
-        # 2. 去除重复文本（基于 text 去重）
-        before = len(all_records)
-        seen_texts = set()
-        deduped: list[dict] = []
-        for r in all_records:
-            if r["text"] not in seen_texts:
-                seen_texts.add(r["text"])
-                deduped.append(r)
-        all_records = deduped
-        category_stats["after_dedup"] = len(all_records)
-        logger.info(f"  去除重复: {before} → {len(all_records)} "
-                     f"(移除 {before - len(all_records)} 条)")
+    # 串行去重（基于 text）
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for record in cleaned:
+        text = record["text"]
+        if text not in seen:
+            seen.add(text)
+            deduped.append(record)
 
-        # 3. 保存为 JSONL
-        output_path = OUTPUT_DIR / f"{category}.jsonl"
-        with open(output_path, "w", encoding="utf-8") as f:
-            for record in all_records:
-                # 确保只输出统一列
-                clean_record = {col: record.get(col) for col in UNIFIED_COLUMNS}
-                f.write(json.dumps(clean_record, ensure_ascii=False) + "\n")
+    logger.info("去重后: %d 条", len(deduped))
+    return deduped
 
-        human_count = sum(1 for r in all_records if r["label"] == 1)
-        ai_count = sum(1 for r in all_records if r["label"] == 0)
-        logger.info(f"  保存到: {output_path} (共 {len(all_records)} 条, "
-                     f"Human: {human_count}, AI: {ai_count})")
 
-        stats[category] = category_stats
-
-    # 汇总统计
-    logger.info("\n" + "=" * 60)
-    logger.info("数据清洗完成！汇总统计：")
-    logger.info("=" * 60)
-    total_cleaned = 0
-    for cat, s in stats.items():
-        logger.info(f"  {cat}: 原始 {s['total_raw']} → 清洗后 {s['after_dedup']}")
-        total_cleaned += s["after_dedup"]
-    logger.info(f"  总计清洗后: {total_cleaned} 条")
-    logger.info(f"  输出目录: {OUTPUT_DIR}")
-
-    return {cat: s["after_dedup"] for cat, s in stats.items()}
+def save(records: list[dict]) -> None:
+    """保存为 JSONL。"""
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    logger.info("已保存到: %s", OUTPUT_FILE)
 
 
 if __name__ == "__main__":
-    clean_and_save()
+    mp.freeze_support()
+
+    parser = argparse.ArgumentParser(description="数据清洗")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="并行进程数（默认 1，串行）")
+    args = parser.parse_args()
+
+    save(clean(workers=args.workers))
