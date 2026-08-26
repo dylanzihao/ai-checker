@@ -23,7 +23,7 @@ _project_root = Path(__file__).resolve().parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.data.loaders import cred, maga
+from src.data.loaders import cred, maga, nlpcc
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -40,7 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 OUTPUT_FILE = PROJECT_ROOT / "data" / "raw" / "unified.jsonl"
 
 # 新增数据集：在 loaders/ 新增模块实现 load()，并在此注册
-LOADERS = [cred, maga]
+LOADERS = [cred, maga, nlpcc]
 
 
 def extract(workers: int = 1) -> list[dict]:

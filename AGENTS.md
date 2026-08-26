@@ -20,9 +20,12 @@ ai-checker/
 │   ├── raw/
 │   │   ├── C-ReD/               # 原始数据，只读不修改
 │   │   ├── MAGA-cn/             # 原始数据，只读不修改
+│   │   ├── NLPCC-2025-Task1/    # 原始数据，只读不修改（train.json + dev.json）
 │   │   └── unified.jsonl        # extract.py 生成的统一格式数据
 │   ├── cleaned/
 │   │   └── cleaned.jsonl        # clean.py 清洗后的数据
+│   ├── eval/
+│   │   └── test_with_label.json # NLPCC OOD 评估基准（不进训练）
 │   └── processed/               # 划分后的数据（JSONL 格式）
 │       ├── train.jsonl
 │       ├── val.jsonl
@@ -32,7 +35,8 @@ ai-checker/
 │   │   ├── extract.py           # 数据提取（多数据集 loader 汇总）
 │   │   ├── loaders/             # 各数据集读取模块
 │   │   │   ├── cred.py          # C-ReD loader
-│   │   │   └── maga.py          # MAGA-cn loader
+│   │   │   ├── maga.py          # MAGA-cn loader
+│   │   │   └── nlpcc.py         # NLPCC-2025-Task1 loader
 │   │   ├── clean.py             # 数据清洗
 │   │   └── split.py             # 数据集划分
 │   ├── train/                   # 训练相关代码
@@ -69,7 +73,12 @@ ai-checker/
 - **MAGA-cn** (`data/raw/MAGA-cn/train/MAGA-cn_train.jsonl` + `data/raw/MAGA-cn/val/MAGA-cn_val.jsonl`)
   - 仅使用 `MAGA-cn` 数据文件，**不使用** `MGB`
   - `model == "human"` 为人类文本，其余为机器文本
-  - 本身已 1:1 平衡，全部保留
+  - AI 文本按 domain 裁剪到 human 的 `AI_RATIO=0.7667` 倍（抵消 NLPCC 的 3:1 不平衡，使全局 1:1）
+- **NLPCC-2025-Task1** (`data/raw/NLPCC-2025-Task1/train.json` + `dev.json`，JSON 数组格式)
+  - 仅使用 `train` + `dev`；`test_with_label.json` 保留在 `data/eval/` 作为独立 OOD 评估基准，**不进训练**
+  - 3 个域（`asap`/`cnewsum`/`csl`，映射为 ASAP/CNewSum/CSL）× 3 模型（GPT-4o/GLM-4-flash/Qwen-turbo）
+  - **label 约定与项目相反**：原始 `0=human/1=machine`，loader 内翻转为 `1=human/0=AI`
+  - 全量保留（不裁剪）：原始 3:1 不平衡，由 MAGA 的 AI 裁剪抵消，全局达到 1:1
 - **label 统一约定**: 1 = human, 0 = AI-generated
 
 ### 数据提取（extract.py）
@@ -77,8 +86,8 @@ ai-checker/
 - 各数据集 loader 位于 `src/data/loaders/`，每个 loader 暴露 `load() -> list[dict]`
 - 统一 schema：`{text, label, category, source}`
   - `label`: int，1=human, 0=AI
-  - `category`: C-ReD 类别目录名 或 MAGA-cn 的 `domain` 字段（仅中间字段，用于分层划分，不进入最终输出）
-  - `source`: `C-ReD` 或 `MAGA-cn`
+  - `category`: C-ReD 类别目录名、MAGA-cn 的 `domain` 字段、或 NLPCC 的 `source` 字段（仅中间字段，用于分层划分，不进入最终输出）
+  - `source`: `C-ReD`、`MAGA-cn` 或 `NLPCC-2025-Task1`
 - 输出 `data/raw/unified.jsonl`
 - 新增数据集：在 `loaders/` 新增模块实现 `load()`，并在 `extract.py` 的 `LOADERS` 中注册
 - **并行**：支持 `--workers`（默认 1，手动指定，`multiprocessing`）并行读取 C-ReD CSV 与解析 MAGA-cn JSONL；C-ReD 机器文本裁剪为串行 + 固定 seed
@@ -94,7 +103,7 @@ ai-checker/
   6. 繁→简转换（`opencc-python-reimplemented` 的 `OpenCC('t2s')`）
   7. 空白归一（`\s+`→空格）+ 去首尾空格
   8. 去包裹引号（循环剥离首尾成对引号：`"` `"` `"` `'` `'` `` ` ``）
-  9. 去除空文本或极短文本（长度 < 100 字符）
+  9. 去除空文本或极短文本（长度 < 10 字符）
 - 去除重复文本（基于 text 去重，串行执行）
 - 输出 `data/cleaned/cleaned.jsonl`
 - **并行**：支持 `--workers`（默认 1，手动指定，`multiprocessing`）并行清洗；opencc 用 `Pool(initializer=...)` 每 worker 初始化一个实例；text 去重串行
@@ -102,7 +111,7 @@ ai-checker/
 ### 数据集划分（split.py）
 
 - **比例**: 8:1:1（训练:验证:测试）
-- **1:1 下采样**: 划分前按 label 分组，多数类随机下采样到少数类数量（固定 seed=42）
+- **平衡策略已下沉到各 loader**：C-ReD 在 loader 内裁剪为 1:1，MAGA-cn 将 AI 裁到 human 的 0.7667 倍，NLPCC 全量保留；三者合计全局 1:1，`split.py` 不再做全局下采样
 - **分层划分**: 按 `(category, label)` 逐层划分，保证各 split 中类别分布和 human/AI 比例一致
 - **全量保留**: 不做目标大小采样，固定随机种子（42）保证可复现
 - 最终输出仅含 `text` + `label`（`data/processed/train.jsonl / val.jsonl / test.jsonl`）
@@ -242,7 +251,7 @@ fp16: true                        # T4 支持混合精度加速
 ### 数据处理
 
 ```bash
-# 1. 数据提取：读取 C-ReD 与 MAGA-cn，统一 schema 后合并
+# 1. 数据提取：读取 C-ReD、MAGA-cn 与 NLPCC-2025-Task1，统一 schema 后合并
 #    输出 data/raw/unified.jsonl
 python src/data/extract.py
 python src/data/extract.py --workers 8   # 并行提取（手动指定进程数）
@@ -252,7 +261,7 @@ python src/data/extract.py --workers 8   # 并行提取（手动指定进程数�
 python src/data/clean.py
 python src/data/clean.py --workers 8     # 并行清洗（手动指定进程数）
 
-# 3. 数据集划分：读取清洗后的数据，1:1 下采样后分层划分 8:1:1
+# 3. 数据集划分：读取清洗后的数据，分层划分 8:1:1（无全局下采样）
 #    输出 data/processed/train.jsonl / val.jsonl / test.jsonl
 python src/data/split.py
 ```

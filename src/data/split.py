@@ -1,8 +1,8 @@
 """
-数据集划分：读取清洗后的数据，1:1 下采样后按 (category, label) 分层划分 8:1:1。
+数据集划分：读取清洗后的数据，按 (category, label) 分层划分 8:1:1。
 
 - 比例: 8:1:1（训练:验证:测试）
-- 1:1 下采样: 划分前按 label 分组，多数类随机下采样到少数类数量（seed=42）
+- 平衡策略已下沉到各 loader（C-ReD 1:1，MAGA AI 裁到 0.7667，NLPCC 全量），此处不再下采样
 - 分层: 按 (category, label) 逐层划分，保证各 split 类别分布和 human/AI 比例一致
 - 全量保留，固定随机种子（42）保证可复现
 - 最终输出仅含 text + label
@@ -54,18 +54,6 @@ def load_records(filepath: Path) -> list[dict]:
     return records
 
 
-def rebalance_1to1(records: list[dict], seed: int) -> list[dict]:
-    """按 label 分组，多数类随机下采样到少数类数量（1:1）。"""
-    rng = random.Random(seed)
-    humans = [r for r in records if r["label"] == 1]
-    ais = [r for r in records if r["label"] == 0]
-    n = min(len(humans), len(ais))
-    rng.shuffle(humans)
-    rng.shuffle(ais)
-    logger.info("1:1 下采样: human=%d, ai=%d → 各 %d", len(humans), len(ais), n)
-    return humans[:n] + ais[:n]
-
-
 def stratified_split(
     records: list[dict],
     train_ratio: float,
@@ -112,8 +100,6 @@ def split_and_save() -> None:
     """主划分流程。"""
     records = load_records(INPUT_FILE)
     logger.info("读取 %d 条", len(records))
-
-    records = rebalance_1to1(records, RANDOM_SEED)
 
     train, val, test = stratified_split(records, TRAIN_RATIO, VAL_RATIO, RANDOM_SEED)
 

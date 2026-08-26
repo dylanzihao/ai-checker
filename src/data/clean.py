@@ -10,7 +10,7 @@
 6. 繁→简转换（OpenCC）
 7. 空白归一 + 去首尾空格
 8. 去包裹引号
-9. 去除空文本或极短文本（长度 < 100 字符）
+9. 去除空文本或极短文本（长度 < 10 字符）
 + 去除重复文本（基于 text 去重，串行）
 
 输出: data/cleaned/cleaned.jsonl
@@ -50,7 +50,7 @@ URL_RE = re.compile(r"https?://\S+|www\.\S+")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 WHITESPACE_RE = re.compile(r"\s+")
 
-MIN_TEXT_LENGTH = 100
+MIN_TEXT_LENGTH = 10
 QUOTE_CHARS = frozenset('"\u201c\u201d\u2018\u2019`')
 
 
