@@ -46,7 +46,8 @@ ai-checker/
 │   ├── inference/               # 推理相关代码
 │   │   ├── convert.py           # 模型转换：FP32 OpenVINO IR（可选 INT8 量化）
 │   │   ├── predict.py           # 推理脚本
-│   │   └── compare.py           # FP32 IR vs INT8 IR 性能对比
+│   │   ├── compare.py           # FP32 IR vs INT8 IR 性能对比
+│   │   └── evaluate.py          # 单模型详细评估（混淆矩阵/ROC/长度分层/场景细分）
 │   └── run.ipynb                # Kaggle 训练入口 Notebook
 ├── models/                      # 模型保存（gitignored）
 │   ├── base/                    # 微调后的 FP32 模型
@@ -205,6 +206,16 @@ fp16: true                        # T4 支持混合精度加速
 - 输出：两个模型的推理耗时、吞吐量（texts/s）、加速比（speedup），以及标签一致性
 - 支持 `--device`（CPU/GPU/NPU）和 `--cache-dir`（编译缓存）
 - 两模型使用相同设备、batch size 和 max_length，保证对比公平
+
+### 详细评估（evaluate.py）
+
+`evaluate.py` 对单个模型做详细评估，复用 `predict.py` 的推理类，支持 FP32 PyTorch / FP32 IR / INT8 IR（自动检测）。
+
+- 评估数据集（存在则评）：
+  - `data/processed/test.jsonl`（in-domain，label 已对齐 1=human/0=AI）
+  - `data/eval/test_with_label.json`（NLPCC OOD 基准，label 翻转 0=human/1=machine）
+- 输出指标：accuracy / macro-F1 / per-class P·R·F1、混淆矩阵（2×2 + 行百分比）、ROC-AUC、长度分层（<64/64-128/128-256/256-512/>=512 字符）、场景细分（Normal/Attack/Varying，仅 NLPCC）
+- 参数：`--model-path`（默认 models/base）、`--device`、`--test-file`、`--nlpcc-eval`、`--batch-size`（默认 32）、`--output-dir`（可选，输出混淆矩阵/ROC PNG）
 
 ### 编译缓存（仅 OpenVINO 模式有效）
 
