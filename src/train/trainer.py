@@ -21,6 +21,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 import numpy as np
+import torch
 from datasets import DatasetDict, load_dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from transformers import (
@@ -95,6 +96,9 @@ def train(config: TrainConfig | None = None) -> None:
     """完整训练流程（Trainer API）。"""
     if config is None:
         config = default_config
+
+    if Path("/kaggle").exists() and not torch.cuda.is_available():
+        raise SystemExit("没有 GPU")
 
     # ---- Tokenizer ----
     model_name = config.resolve_model_name()
